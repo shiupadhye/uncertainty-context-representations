@@ -3,3 +3,5 @@
 
 # ignore R files
 *.R
+*.RData
+*.RHistory
