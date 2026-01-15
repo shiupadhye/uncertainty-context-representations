@@ -8,13 +8,12 @@ from transformers import GPT2LMHeadModel, PreTrainedTokenizerFast
 TOKENIZER_PATH = "/home/shiva/PROJECTS/word-infill-model-training/tokenizer/candor_tokenizer.json"
 MODEL_PATH = "/home/shiva/PROJECTS/word-infill-model-training/models/gpt2-fw-candor/checkpoint-662895"
 
-def score(logits, token):
+def score(logits, token_id):
     """
-    Compute log p(w | C) for an AR LM 
+    Compute log p(token | context) from AR LM logits.
     """
-    # tokenize w
-    token_id = tokenizer.encode(token)
-    log_probs = F.log_softmax(logits, dim=-1)
+    last_logits = logits[0, -1]          
+    log_probs = F.log_softmax(last_logits, dim=-1)
     return log_probs[token_id].item()
 
 
@@ -57,9 +56,9 @@ def cosine_sim_per_token(embeds, noisy_embeds):
     n = noisy_embeds[0]
     return F.cosine_similarity(e, n, dim=-1)
 
-def inject_noise_in_prefix(embeds,start_idx,end_idx,A=1,lam=0.5):
+def inject_noise_in_prefix(embeds,start_idx,end_idx,A,lam):
     """
-    Exponential decay in prefix.
+    Exponential decay in prefix
     """
     noisy_embeds = embeds.clone()
     _, seq_len, D = embeds.shape
@@ -74,7 +73,28 @@ def inject_noise_in_prefix(embeds,start_idx,end_idx,A=1,lam=0.5):
 
     return noisy_embeds
 
-def prepare_noisy_prefix(model,tokenizer,context,infill=False):
+def inject_noise_in_suffix(embeds,start_idx,end_idx,A,lam):
+    """
+    Exponential decay in suffix
+    """
+    noisy_embeds = embeds.clone()
+    _, seq_len, D = embeds.shape
+
+    for i in range(start_idx, end_idx):
+        # recency of token
+        distance = i - start_idx
+        # A * exp{-lambda * distance}
+        sigma = A * (1 - math.exp(-lam * distance))
+        # generate noise and decay noise 
+        noisy_embeds[0, i,:] += torch.randn(D, device=embeds.device) * sigma
+
+    return noisy_embeds
+
+
+def prepare_noisy_prefix(model,tokenizer,context,A,lam,infill=False):
+    """
+    Injects noise into the prefix
+    """
     context_tokens = context.split()
     if infill:
         start_idx = 3
@@ -84,24 +104,190 @@ def prepare_noisy_prefix(model,tokenizer,context,infill=False):
         end_idx = len(context_tokens)
     
     embeds = get_embeddings(model,tokenizer,context)    
-    noisy_embeds = inject_noise_in_prefix(embeds,start_idx,end_idx)
-    return embeds, noisy_embeds
+    if A == 0.0:
+        return embeds
+    else:
+        modified_embeds = inject_noise_in_prefix(embeds,start_idx,end_idx,A,lam)
+        return modified_embeds
 
+def prepare_noisy_suffix(embeds,start_idx,end_idx,A,lam,infill):
+    """
+    Injects noise into the suffix
+    """
+    context_tokens = context.split()
+    if infill:
+        start_idx = 1
+        end_idx = context_tokens.index("<MID>")
+    else:
+        start_idx = 2
+        end_idx = len(context_tokens)
+    
+    embeds = get_embeddings(model,tokenizer,context)   
+    if A == 0.0:
+         return embeds
+    else:
+        modified_embeds = inject_noise_in_prefix(embeds,start_idx,end_idx,A,lam)
+        return modified_embeds
 
 
 tokenizer = PreTrainedTokenizerFast(tokenizer_file=TOKENIZER_PATH)
 model = GPT2LMHeadModel.from_pretrained(MODEL_PATH)
 
-#context = "<eos> B: <PRE> The capital of France is <MID>"
-#embeds,noisy_embeds = prepare_noisy_prefix(model,tokenizer,context,infill=True)
-#sims = cosine_sim_per_token(embeds, noisy_embeds)
 
-#for i, sim in enumerate(sims):#
-#    print(i, sim.item())
-
-# 
-data = pd.read_csv('SWBD_DurAnalysisData.csv')
+data = pd.read_csv('SWBD_durData_fluent.csv')
 data.head()
+
+infill = True
+direction = "backward"
+A = 1.0
+lam = 0.5
+
+print("----------------------------")
+
+print("Direction: %s" % direction)
+print("Infill: %s" % str(infill))
+print("A = %f" % A)
+print("lam = %f" % lam)
+
+print("----------------------------")
+
+
+contexts = []
+target_scores = []
+uttrIDs = np.unique(data['uttrID'].values)
+subset_uttrIDs = uttrIDs[:1000]
+
+for uttrID in subset_uttrIDs:
+    uttrData = data[data['uttrID'] == uttrID]
+    spID = uttrData['spID'].values[0].split("_")[-1]
+    uWordIDs = list(uttrData['uWordID'].values)
+    uttrWords = list(uttrData['word'].values)
+
+    if direction == "forward":
+        if infill:
+            prefix = "<eos>" + " " + spID + ": " + "<PRE>" + " " 
+        else:
+            prefix = "<eos>" + " " + spID + ": "
+
+
+        i = -1
+        while i < len(uttrWords) - 1:
+            if i == -1:
+                if infill:
+                    context = prefix + "<MID>"
+                else:
+                    context = prefix
+                target = uttrWords[0]
+
+            elif i > -1:
+                prefix += uttrWords[i] + " " 
+                if infill:
+                    context = prefix + "<MID>"
+                else:
+                    context = prefix
+
+                target = uttrWords[i+1]
+
+            # sanity check
+            print(context)
+            print(target)
+            embeds = prepare_noisy_prefix(model, tokenizer, context, A, lam, infill)
+            target_id = tokenizer.encode(target)[0]
+
+            with torch.no_grad():
+                outputs = model(inputs_embeds = embeds)
+                logits = outputs.logits
+                target_score = score(logits,target_id)
+                # store
+                contexts.append(context)
+                target_scores.append(target_score)
+                
+            i+=1
+    
+    elif direction == 'backward' and infill == False:
+        rev_target_scores = []
+        rev_contexts = []
+        rev_uttrWords = uttrWords[::-1]
+        prefix = "<eos>" + " " + spID + ": "
+
+        i = -1
+        while i < len(rev_uttrWords) - 1:
+
+            if i == -1:
+                context = prefix
+                target = rev_uttrWords[0]
+
+            elif i > -1:
+                prefix += rev_uttrWords[i] + " "
+                context = prefix
+                target = rev_uttrWords[i + 1]
+
+            # sanity check
+            print(context)
+            print(target)
+
+            embeds = prepare_noisy_prefix(model, tokenizer, context, A, lam, infill)
+            target_id = tokenizer.encode(target)[0]
+
+            with torch.no_grad():
+                outputs = model(inputs_embeds=embeds)
+                logits = outputs.logits
+                target_score = score(logits, target_id)
+
+                rev_contexts.append(context)
+                rev_target_scores.append(target_score)
+            
+
+            i+=1
+    
+        rev_contexts = rev_contexts[::-1]
+        rev_target_scores = rev_target_scores[::-1]
+
+        contexts.extend(rev_contexts)
+        target_scores.extend(rev_target_scores)
+
+    elif direction == 'backward' and infill == True:
+        rev_target_scores = []
+        rev_contexts = []
+
+        i = 0
+        while i < len(uttrWords):
+            suffix = " ".join(uttrWords[i+1:])
+            context = "<SUF>" + " " + suffix + " " + "<MID>"
+            target = uttrWords[i]
+
+            print(context)
+            print(target)
+
+            embeds = prepare_noisy_suffix(model,tokenizer,context,A,lam,infill)
+            target_id = tokenizer.encode(target)[0]
+
+            with torch.no_grad():
+                outputs = model(inputs_embeds = embeds)
+                logits = outputs.logits
+                target_score = score(logits,target_id)
+                # store
+                contexts.append(context)
+                target_scores.append(target_score)
+
+            i += 1
+
+
+subset = data[data['uttrID'].isin(subset_uttrIDs)]
+subset['bwInfillContext_lam0.5'] = contexts
+subset['bwInfillPred_lam0.5'] = target_scores
+subset.to_csv('SWBD_durData_bwInfill_lam0.5.csv',index=False)
+    
+                
+                
+                
+
+
+
+            
+
+
+
 
 
 
