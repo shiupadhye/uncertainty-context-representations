@@ -1,5 +1,6 @@
 # ignore .csv
 *.csv
+*.ipynb
 
 # ignore R files
 *.R
