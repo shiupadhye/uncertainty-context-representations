@@ -6,3 +6,8 @@
 *.R
 *.RData
 *.RHistory
+
+# ignore folders
+archive/
+
+
