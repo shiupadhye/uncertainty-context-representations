@@ -1,3 +1,4 @@
+import os
 import re
 import math
 import torch
@@ -7,8 +8,41 @@ import torch.nn.functional as F
 from collections import defaultdict, deque
 from transformers import GPT2LMHeadModel, PreTrainedTokenizerFast
 
+
+
 TOKENIZER_PATH = "/home/shiva/PROJECTS/word-infill-model-training/tokenizer/candor_tokenizer.json"
 MODEL_PATH = "/home/shiva/PROJECTS/word-infill-model-training/models/gpt2-fw-candor/checkpoint-662895"
+
+tokenizer = PreTrainedTokenizerFast(tokenizer_file=TOKENIZER_PATH)
+model = GPT2LMHeadModel.from_pretrained(MODEL_PATH)
+
+# noise parameters
+noise = True
+# for exp decay
+# scaling
+A = 0
+# decay rate
+lam = 0.8
+# linear decay
+lam0 = 0
+beta = 0.001
+# causal or bidirectional
+lm_mode = 'causal'
+# prefix or suffix
+context_type = 'prefix'
+# linear, dependency, or random
+noise_type = 'random'
+
+print("LM Mode: %s" % lm_mode)
+print("Context type: %s" % context_type)
+print("Noise type: %s" % noise_type)
+print("A = %.2f" % A)
+print("Lambda = %.2f" % lam)
+
+
+data = pd.read_csv('SWBD_durationData_depparsed_subset2K_linNoise_scores.csv')
+
+norms_by_distance = defaultdict(list)
 
 def score(logits, target):
     """
@@ -126,9 +160,153 @@ def logits_from_embeds(model, embeds, attention_mask=None):
         logits = outputs.logits
     return logits
 
-def prefix_noise(embeds, start_idx, end_idx, A, lam):
+def prefix_rand_noise(embeds, start_idx, end_idx, beta, lam0):
+    noisy_embeds = embeds.clone()
+    _, seq_len, D = embeds.shape
+    span = end_idx - (start_idx + 1)
+    if span <= 0:
+        return noisy_embeds
+    
+    # Same sigmas as linear schedule, but randomly permuted across positions
+    distances = torch.arange(1, span + 1, dtype=torch.float, device=embeds.device)
+    sigmas = beta * distances + lam0
+    sigmas = sigmas[torch.randperm(span, device=embeds.device)]
+    
+    for k, i in enumerate(range(start_idx + 1, end_idx)):
+        noisy_embeds[0, i, :] += torch.randn(D, device=embeds.device) * sigmas[k]
+    return noisy_embeds
+
+
+def suffix_rand_noise(embeds, start_idx, end_idx, beta, lam0):
     """
-    Injects noise in prefix embeddings
+    Baseline: injects Gaussian noise in suffix embeddings with the same
+    sigma multiset as suffix_lin_noise, but randomly permuted across positions.
+    Matches total noise energy per sample while removing position-sigma coupling.
+    """
+    noisy_embeds = embeds.clone()
+    _, seq_len, D = embeds.shape
+
+    span = end_idx - (start_idx + 1)  # number of suffix tokens
+    if span <= 0:
+        return noisy_embeds
+
+    # Same sigmas as the linear schedule, randomly permuted across positions
+    distances = torch.arange(1, span + 1, dtype=torch.float, device=embeds.device)
+    sigmas = beta * distances + lam0
+    sigmas = sigmas[torch.randperm(span, device=embeds.device)]
+
+    for k, i in enumerate(range(start_idx + 1, end_idx)):
+        noisy_embeds[0, i, :] += torch.randn(D, device=embeds.device) * sigmas[k]
+
+    return noisy_embeds
+
+
+def prefix_lin_noise(embeds, start_idx, end_idx, beta, lam0):
+    """
+    Injects noise in prefix embeddings according to linear decay
+    embeds: model embeddings
+    start_idx: position of <PRE> token
+    end_idx: position of <SUF> or <MID> token
+    beta: slope
+    lam0: intercept
+    """
+    noisy_embeds = embeds.clone()
+    _, seq_len, D = embeds.shape
+
+    for i in range(start_idx+1, end_idx):
+        # distance from the current word (right before <MID>)
+        distance = (end_idx - 1) - i + 1   # 0 for the token right before <MID>
+        # noise scale increases with distance
+        sigma = beta * distance + lam0
+        # add Gaussian noise
+        noisy_embeds[0, i, :] += torch.randn(D, device=embeds.device) * sigma
+
+    return noisy_embeds
+
+def suffix_lin_noise(embeds, start_idx, end_idx, beta, lam0):
+    """
+    Injects noise in suffix embeddings according to linear decay
+    embeds: model embeddings
+    start_idx: position of <SUF>
+    end_idx: position of <MID>
+    A: scaling constant
+    lam: decay rate
+    """
+    noisy_embeds = embeds.clone()
+    _, seq_len, D = embeds.shape
+
+    # Suffix region: (start_idx + 1) ... (end_idx - 1)
+    for i in range(start_idx + 1, end_idx):
+        # distance from the token right after <SUF>
+        distance = i - (start_idx + 1) + 1 # 0 for the token right after <SUF>
+        # noise scale increases with distance
+        sigma = beta * distance + lam0
+        # add Gaussian noise
+        noisy_embeds[0, i, :] += torch.randn(D, device=embeds.device) * sigma
+    return noisy_embeds
+
+
+
+def prefix_lin_noise_dep(embeds, start_idx, end_idx, beta, lam0, lm_idx_to_dep_id, dep_dist):
+    """
+    Injects noise in prefix embeddings based on dependency distance and expontential decay 
+    embeds: model embeddings
+    start_idx: position of <SUF>
+    end_idx: position of <MID>
+    beta: slope
+    lam0: intercept
+    lm_idx_to_dep_id: lookup table that maps LM position to dep id
+    dep dist: dict containing dependency distances to the current word
+    """
+    noisy_embeds = embeds.clone()
+    _, _, D = embeds.shape
+
+    for i in range(start_idx, end_idx):
+        dep_id = lm_idx_to_dep_id.get(i, None)
+        if dep_id is None:
+            continue
+        d = dep_dist.get(dep_id, None)
+        if d is None:
+            continue
+
+        sigma = beta * d + lam0
+        if sigma > 0:
+            noisy_embeds[0, i, :] += torch.randn(D, device=embeds.device) * sigma
+
+    return noisy_embeds
+
+def suffix_lin_noise_dep(embeds, start_idx, end_idx, beta, lam0, lm_idx_to_dep_id, dep_dist):
+    """
+    Injects noise in suffix embeddings based on dependency distance and expontential decay 
+    embeds: model embeddings
+    start_idx: position of <SUF>
+    end_idx: position of <MID>
+    beta: slope
+    lam0: intercept
+    lm_idx_to_dep_id: lookup table that maps LM position to dep id
+    dep dist: dict containing dependency distances to the current word
+    """
+    noisy_embeds = embeds.clone()
+    _, _, D = embeds.shape
+
+    for i in range(start_idx + 1, end_idx):
+        dep_id = lm_idx_to_dep_id.get(i, None)
+        if dep_id is None:
+            continue
+        d = dep_dist.get(dep_id, None)
+        if d is None:
+            continue
+
+        sigma = beta * d + lam0
+        if sigma > 0:
+            noisy_embeds[0, i, :] += torch.randn(D, device=embeds.device) * sigma
+
+    return noisy_embeds
+
+
+def prefix_exp_noise(embeds, start_idx, end_idx, A, lam):
+    """
+    Injects noise in prefix embeddings according to exponential decay
     embeds: model embeddings
     start_idx: position of <PRE> token
     end_idx: position of <SUF> token
@@ -148,9 +326,9 @@ def prefix_noise(embeds, start_idx, end_idx, A, lam):
 
     return noisy_embeds
 
-def suffix_noise(embeds, start_idx, end_idx, A, lam):
+def suffix_exp_noise(embeds, start_idx, end_idx, A, lam):
     """
-    Injects noise in suffix embeddings
+    Injects noise in suffix embeddings according to exponential decay
     embeds: model embeddings
     start_idx: position of <SUF>
     end_idx: position of <MID>
@@ -171,9 +349,9 @@ def suffix_noise(embeds, start_idx, end_idx, A, lam):
     return noisy_embeds
 
 
-def prefix_noise_dep(embeds, start_idx, end_idx, A, lam, lm_idx_to_dep_id, dep_dist):
+def prefix_exp_noise_dep(embeds, start_idx, end_idx, A, lam, lm_idx_to_dep_id, dep_dist):
     """
-    Injects noise in prefix embeddings based on dependency distance
+    Injects noise in prefix embeddings based on dependency distance and expontential decay 
     embeds: model embeddings
     start_idx: position of <SUF>
     end_idx: position of <MID>
@@ -199,9 +377,9 @@ def prefix_noise_dep(embeds, start_idx, end_idx, A, lam, lm_idx_to_dep_id, dep_d
 
     return noisy_embeds
 
-def suffix_noise_dep(embeds, start_idx, end_idx, A, lam, lm_idx_to_dep_id, dep_dist):
+def suffix_exp_noise_dep(embeds, start_idx, end_idx, A, lam, lm_idx_to_dep_id, dep_dist):
     """
-    Injects noise in suffix embeddings based on dependency distance
+    Injects noise in suffix embeddings based on dependency distance and expontential decay 
     embeds: model embeddings
     start_idx: position of <SUF>
     end_idx: position of <MID>
@@ -243,28 +421,40 @@ def display_norm(norms,context_tokens):
         val = norms[i].item() if hasattr(norms[i], "item") else float(norms[i])
         print(f"{tok}\t{val:.6f}")
 
+def record_L2_by_distance(norms, context_tokens, context_type, noise_type,
+    start_idx, end_idx, lm_to_dep=None, dep_dist=None):
+    """
+    Saves L2 norm by distance (linear or dependency)
+    """
+    special_tokens = {"<eos>", "<PRE>", "<SUF>", "<MID>", "A:", "B:"}
 
-tokenizer = PreTrainedTokenizerFast(tokenizer_file=TOKENIZER_PATH)
-model = GPT2LMHeadModel.from_pretrained(MODEL_PATH)
+    for i_tok, tok in enumerate(context_tokens):
+        if tok in special_tokens:
+            continue
 
-# noise scalar: 1.0 (noisy), 0.0 (no noise)
-A = 1.0
-lam = 0.8
-# causal or bidirectional
-lm_mode = 'causal'
-# prefix or suffix
-context_type = 'suffix'
-# temporal or dependency
-noise_type = 'dependency'
+        val = norms[i_tok].item()
 
-print("LM Mode: %s" % lm_mode)
-print("Context type: %s" % context_type)
-print("Noise type: %s" % noise_type)
-print("A = %.2f" % A)
-print("Lambda = %.2f" % lam)
+        if noise_type == "linear" or noise_type == "random":
+            if context_type == "prefix":
+                if not (start_idx < i_tok < end_idx):
+                    continue
+                d = (end_idx - 1) - i_tok + 1
+
+            elif context_type == "suffix":
+                if not (start_idx < i_tok < end_idx):
+                    continue
+                d = i_tok - (start_idx + 1) + 1
+
+        else:  
+            dep_id = lm_to_dep.get(i_tok, None)
+            if dep_id is None:
+                continue
+            d = dep_dist.get(dep_id, None)
+
+        if d is not None:
+            norms_by_distance[d].append(val)
 
 
-data = pd.read_csv('SWBD_DurData_depparsed100_scores.csv')
 uttrIDs = np.unique(data['uttrID'].values)
 subset_uttrIDs = uttrIDs
 
@@ -272,8 +462,10 @@ contexts = []
 targets = []
 scores = []
 for uttrID in subset_uttrIDs:
+    if uttrID % 100 == 0:
+        print(uttrID)
     uttr_df = data[data['uttrID'] == uttrID]
-    role = uttr_df['spID'].values[0].split("_")[-1]
+    role = uttr_df['role'].values[0].split("_")[-1]
     uWordIDs = list(uttr_df['uWordID'].values)
     uttrWords = list(uttr_df['word'].values)
 
@@ -308,7 +500,7 @@ for uttrID in subset_uttrIDs:
                 orig_embeds = get_embeddings(model, tokenizer, context)
                 context_tokens = context.split()
 
-                if A == 0:
+                if not noise:
                     print("No noise injection")
                     with torch.no_grad():
                         outputs = model(inputs_embeds = orig_embeds)
@@ -319,10 +511,14 @@ for uttrID in subset_uttrIDs:
                         scores.append(target_score)
                 
                 else:
-                    if noise_type == 'temporal':
-                        noisy_embeds = prefix_noise(orig_embeds, start_idx=pre_idx, end_idx=mid_idx, A=A,lam=lam)
+                    if noise_type == 'linear':
+                        noisy_embeds = prefix_lin_noise(orig_embeds, start_idx=pre_idx, end_idx=mid_idx, beta=beta,lam0=lam0)
                         norms = L2_norm(orig_embeds, noisy_embeds)
                         display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="prefix", noise_type=noise_type,
+                        start_idx=pre_idx,end_idx=mid_idx,
+                        lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
 
                         with torch.no_grad():
                             outputs = model(inputs_embeds = noisy_embeds)
@@ -332,16 +528,20 @@ for uttrID in subset_uttrIDs:
                             targets.append(target)
                             scores.append(target_score)
 
-                    if noise_type == 'dependency':
+                    elif noise_type == 'dependency':
                         current_token_id = int(uttr_df.iloc[i+1]["token_id"])
                         dep_dist = compute_dep_distances(uttr_graph,current_token_id)
                         lm_to_dep = lm_idx_to_dep_id(context_tokens, uttr_df)
 
-                        noisy_embeds = prefix_noise_dep(orig_embeds,start_idx=pre_idx,end_idx=mid_idx,
-                        A=A,lam=lam,lm_idx_to_dep_id=lm_to_dep,dep_dist=dep_dist)
+                        noisy_embeds = prefix_lin_noise_dep(orig_embeds,start_idx=pre_idx,end_idx=mid_idx,
+                        beta=beta,lam0=lam0,lm_idx_to_dep_id=lm_to_dep,dep_dist=dep_dist)
 
                         norms = L2_norm(orig_embeds, noisy_embeds)
                         display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="prefix", noise_type=noise_type,
+                        start_idx=pre_idx,end_idx=mid_idx,
+                        lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
 
                         with torch.no_grad():
                             outputs = model(inputs_embeds = noisy_embeds)
@@ -351,8 +551,23 @@ for uttrID in subset_uttrIDs:
                             targets.append(target)
                             scores.append(target_score)
 
+                    elif noise_type == 'random':
+                        noisy_embeds = prefix_rand_noise(orig_embeds, start_idx=pre_idx, end_idx=mid_idx, beta=beta,lam0=lam0)
+                        norms = L2_norm(orig_embeds, noisy_embeds)
+                        display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="prefix", noise_type=noise_type,
+                        start_idx=pre_idx,end_idx=mid_idx,
+                        lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
 
-
+                        with torch.no_grad():
+                            outputs = model(inputs_embeds = noisy_embeds)
+                            logits = outputs.logits
+                            target_score = score(logits,target)
+                            contexts.append(context)
+                            targets.append(target)
+                            scores.append(target_score)
+                        
                 i+=1
 
         elif context_type == 'suffix':
@@ -370,7 +585,7 @@ for uttrID in subset_uttrIDs:
                 print(context)
                 print(target)
 
-                if A == 0:
+                if not noise:
                     print("No noise injection")
                     with torch.no_grad():
                         outputs = model(inputs_embeds = orig_embeds)
@@ -381,11 +596,14 @@ for uttrID in subset_uttrIDs:
                         scores.append(target_score)
                 
                 else:
-                    if noise_type == 'temporal':
-                        noisy_embeds = suffix_noise(orig_embeds, start_idx=suf_idx, end_idx=mid_idx, A=A,lam=lam)
+                    if noise_type == 'linear':
+                        noisy_embeds = suffix_lin_noise(orig_embeds, start_idx=suf_idx, end_idx=mid_idx, beta=beta,lam0=lam0)
                         norms = L2_norm(orig_embeds, noisy_embeds)
                         display_norm(norms,context_tokens)
-
+                        record_L2_by_distance(norms,context_tokens,context_type="suffix",noise_type=noise_type,
+                        start_idx=suf_idx, end_idx=mid_idx,lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
+                        
                         with torch.no_grad():
                             outputs = model(inputs_embeds = noisy_embeds)
                             logits = outputs.logits
@@ -399,11 +617,31 @@ for uttrID in subset_uttrIDs:
                         dep_dist = compute_dep_distances(uttr_graph,current_token_id)
                         lm_to_dep = lm_idx_to_dep_id(context_tokens, uttr_df)
 
-                        noisy_embeds = suffix_noise_dep(orig_embeds,start_idx=suf_idx,end_idx=mid_idx,
-                        A=A,lam=lam,lm_idx_to_dep_id=lm_to_dep,dep_dist=dep_dist)
+                        noisy_embeds = suffix_lin_noise_dep(orig_embeds,start_idx=suf_idx,end_idx=mid_idx,
+                        beta=beta,lam0=lam0,lm_idx_to_dep_id=lm_to_dep,dep_dist=dep_dist)
 
                         norms = L2_norm(orig_embeds, noisy_embeds)
                         display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="suffix",noise_type=noise_type,
+                        start_idx=suf_idx, end_idx=mid_idx,lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
+
+                        with torch.no_grad():
+                            outputs = model(inputs_embeds = noisy_embeds)
+                            logits = outputs.logits
+                            target_score = score(logits,target)
+                            contexts.append(context)
+                            targets.append(target)
+                            scores.append(target_score)
+
+                    elif noise_type == 'random':
+                        noisy_embeds = suffix_rand_noise(orig_embeds, start_idx=pre_idx, end_idx=mid_idx, beta=beta,lam0=lam0)
+                        norms = L2_norm(orig_embeds, noisy_embeds)
+                        display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="prefix", noise_type=noise_type,
+                        start_idx=pre_idx,end_idx=mid_idx,
+                        lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
 
                         with torch.no_grad():
                             outputs = model(inputs_embeds = noisy_embeds)
@@ -437,8 +675,9 @@ for uttrID in subset_uttrIDs:
 
             pre_idx, suf_idx, mid_idx = extract_indices(context)
             orig_embeds = get_embeddings(model, tokenizer, context)
+            context_tokens = context.split()
 
-            if A == 0:
+            if not noise:
                 with torch.no_grad():
                     outputs = model(inputs_embeds = orig_embeds)
                     logits = outputs.logits
@@ -449,10 +688,13 @@ for uttrID in subset_uttrIDs:
             
             else:
                 if context_type == 'prefix':
-                    if noise_type == 'temporal':
-                        noisy_embeds = prefix_noise(orig_embeds, start_idx=pre_idx, end_idx=suf_idx, A=A,lam=lam)
+                    if noise_type == 'linear':
+                        noisy_embeds = prefix_lin_noise(orig_embeds, start_idx=pre_idx, end_idx=suf_idx, beta=beta,lam0=lam0)
                         norms = L2_norm(orig_embeds, noisy_embeds)
                         display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms, context_tokens, context_type="prefix",noise_type=noise_type,
+                        start_idx=pre_idx,end_idx=suf_idx, lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
 
                         with torch.no_grad():
                             outputs = model(inputs_embeds = noisy_embeds)
@@ -463,9 +705,29 @@ for uttrID in subset_uttrIDs:
                             scores.append(target_score)
                     
                     elif noise_type == 'dependency':
-                        noisy_embeds = prefix_noise(orig_embeds, start_idx=pre_idx, end_idx=suf_idx, A=A,lam=lam)
+                        noisy_embeds = prefix_lin_noise_dep(orig_embeds, start_idx=pre_idx, end_idx=suf_idx, beta=beta,lam0=lam0)
                         norms = L2_norm(orig_embeds, noisy_embeds)
                         display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms, context_tokens, context_type="prefix",noise_type=noise_type,
+                        start_idx=pre_idx,end_idx=suf_idx, lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
+
+                        with torch.no_grad():
+                            outputs = model(inputs_embeds = noisy_embeds)
+                            logits = outputs.logits
+                            target_score = score(logits,target)
+                            contexts.append(context)
+                            targets.append(target)
+                            scores.append(target_score)
+                    
+                    elif noise_type == 'random':
+                        noisy_embeds = prefix_rand_noise(orig_embeds, start_idx=pre_idx, end_idx=mid_idx, beta=beta,lam0=lam0)
+                        norms = L2_norm(orig_embeds, noisy_embeds)
+                        display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="prefix", noise_type=noise_type,
+                        start_idx=pre_idx,end_idx=mid_idx,
+                        lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
 
                         with torch.no_grad():
                             outputs = model(inputs_embeds = noisy_embeds)
@@ -476,10 +738,13 @@ for uttrID in subset_uttrIDs:
                             scores.append(target_score)
                 
                 if context_type == 'suffix':
-                    if noise_type == 'temporal':
-                        noisy_embeds = suffix_noise(orig_embeds, start_idx=suf_idx, end_idx=mid_idx, A=A,lam=lam)
+                    if noise_type == 'linear':
+                        noisy_embeds = suffix_lin_noise(orig_embeds, start_idx=suf_idx, end_idx=mid_idx, beta=beta,lam0=lam0)
                         norms = L2_norm(orig_embeds, noisy_embeds)
                         display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="suffix",noise_type=noise_type,
+                        start_idx=suf_idx, end_idx=mid_idx,lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
 
                         with torch.no_grad():
                             outputs = model(inputs_embeds = noisy_embeds)
@@ -494,11 +759,31 @@ for uttrID in subset_uttrIDs:
                         dep_dist = compute_dep_distances(uttr_graph,current_token_id)
                         lm_to_dep = lm_idx_to_dep_id(context_tokens, uttr_df)
 
-                        noisy_embeds = suffix_noise_dep(orig_embeds,start_idx=suf_idx,end_idx=mid_idx,
-                        A=A,lam=lam,lm_idx_to_dep_id=lm_to_dep,dep_dist=dep_dist)
+                        noisy_embeds = suffix_lin_noise_dep(orig_embeds,start_idx=suf_idx,end_idx=mid_idx,
+                        beta=beta,lam0=lam0,lm_idx_to_dep_id=lm_to_dep,dep_dist=dep_dist)
 
                         norms = L2_norm(orig_embeds, noisy_embeds)
                         display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="suffix",noise_type=noise_type,
+                        start_idx=suf_idx, end_idx=mid_idx,lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
+
+                        with torch.no_grad():
+                            outputs = model(inputs_embeds = noisy_embeds)
+                            logits = outputs.logits
+                            target_score = score(logits,target)
+                            contexts.append(context)
+                            targets.append(target)
+                            scores.append(target_score)
+                    
+                    elif noise_type == 'random':
+                        noisy_embeds = suffix_rand_noise(orig_embeds, start_idx=pre_idx, end_idx=mid_idx, beta=beta,lam0=lam0)
+                        norms = L2_norm(orig_embeds, noisy_embeds)
+                        display_norm(norms,context_tokens)
+                        record_L2_by_distance(norms,context_tokens,context_type="prefix", noise_type=noise_type,
+                        start_idx=pre_idx,end_idx=mid_idx,
+                        lm_to_dep=lm_to_dep if noise_type == "dependency" else None,
+                        dep_dist=dep_dist if noise_type == "dependency" else None,)
 
                         with torch.no_grad():
                             outputs = model(inputs_embeds = noisy_embeds)
@@ -512,10 +797,24 @@ for uttrID in subset_uttrIDs:
 
             i+=1
 
+
+if noise:  
+    rows = []
+    for d, vals in norms_by_distance.items():
+        rows.append({
+            "distance": int(d),
+            "mean_L2": float(np.mean(vals)),
+            "N": int(len(vals)),
+        })
+
+    df_stats = pd.DataFrame(rows).sort_values("distance")
+
+    out_path = f"mean_L2_by_distance_{noise_type}_{context_type}_{lm_mode}_B{beta}_lam0{lam0}.csv"
+    df_stats.to_csv(os.path.join("norms",out_path), index=False)
       
 subset = data[data['uttrID'].isin(subset_uttrIDs)]
-subset['suffix_depNoise0.8_context'] = contexts
-subset['suffix_depNoise0.8_target'] = targets
-subset['suffix_depNoise0.8_score'] = scores
-subset.to_csv('SWBD_DurData_depparsed100_scores.csv',index=False)
+subset['prefix_rand_beta0.001_context'] = contexts
+subset['prefix_rand_beta0.001_target'] = targets
+subset['prefix_rand_beta0.001_score'] = scores
+subset.to_csv('SWBD_durationData_depparsed_subset2K_linNoise_scores.csv',index=False)
 

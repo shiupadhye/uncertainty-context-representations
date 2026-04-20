@@ -7,6 +7,10 @@
 *.RData
 *.RHistory
 
+# ignore
+.claude/
+.DS_Store
+
 # ignore folders
 archive/
 
