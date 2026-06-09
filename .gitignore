@@ -12,6 +12,7 @@
 .DS_Store
 
 # ignore folders
-archive/
+data/
+
 
 
